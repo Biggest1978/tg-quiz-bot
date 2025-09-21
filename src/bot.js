@@ -349,16 +349,23 @@ bot.command("stats", async (ctx) => {
   await ctx.reply(`Runtime stats: active sessions = ${sessions.size}`);
 });
 
-/* ---------- keep alive & safety ---------- */
+/* ---------- errors & launch ---------- */
 bot.catch((err) => console.error("Bot error:", err));
-process.on("unhandledRejection", (e) =>
-  console.error("unhandledRejection:", e)
-);
-process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
 
-bot.launch().then(() => console.log("Bot started (long-polling)"));
-process.once("SIGINT", () => bot.stop("SIGINT"));
-process.once("SIGTERM", () => bot.stop("SIGTERM"));
+const USE_WEBHOOK = !!(
+  process.env.WEBHOOK_URL && process.env.WEBHOOK_URL.trim()
+);
+
+// Если WEBHOOK_URL не задан — работаем в long-polling (локально, dev)
+// На Render (как Web Service) WEBHOOK_URL будет задан, и запустится server.js
+if (!USE_WEBHOOK) {
+  bot.launch().then(() => console.log("Bot started (long-polling)"));
+  process.once("SIGINT", () => bot.stop("SIGINT"));
+  process.once("SIGTERM", () => bot.stop("SIGTERM"));
+}
+
+module.exports = bot;
+
 // --- tiny HTTP server for health/keep-alive ---
 try {
   const express = require("express");
