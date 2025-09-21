@@ -3,7 +3,13 @@ const fs = require("fs");
 const path = require("path");
 const { Telegraf, Markup } = require("telegraf");
 
-/* ---------- загрузка контента ---------- */
+/* ---------- helpers ---------- */
+const bool = (v) => /^true$/i.test(String(v || ""));
+const USE_DEBUG = bool(process.env.DEBUG_USE_DEBUG_DECK);
+const ANALYTICS_URL = process.env.ANALYTICS_URL || "";
+const ANALYTICS_TOKEN = process.env.ANALYTICS_TOKEN || "";
+
+/* ---------- load content ---------- */
 const CANDIDATE_PATHS = [
   path.join(__dirname, "game_content.json"),
   path.join(__dirname, "..", "media", "game_content.json"),
@@ -26,17 +32,30 @@ if (!content) {
   process.exit(1);
 }
 
-/* ---------- телеграм-бот ---------- */
+/* ---------- bot ---------- */
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) throw new Error("Нет TELEGRAM_BOT_TOKEN в .env");
+
 const bot = new Telegraf(token);
+const sessions = new Map(); // userId -> { deck, i, score, awaiting }
 
-/* ---------- простейшее хранилище сессий ---------- */
-const sessions = new Map(); // key: userId, value: { deck, i, score, awaiting }
+/* ---------- analytics ---------- */
+async function track(ev, payload = {}) {
+  if (!ANALYTICS_URL || !ANALYTICS_TOKEN) return;
+  try {
+    await fetch(ANALYTICS_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: ANALYTICS_TOKEN, event: ev, ...payload }),
+    });
+  } catch (e) {
+    console.error("[analytics] failed:", e.message);
+  }
+}
 
-/* ---------- утилиты рендера клавиатур ---------- */
-function toInlineKeyboard(buttons = []) {
-  const rows = buttons.map((btn) => {
+/* ---------- keyboards ---------- */
+function toInlineKeyboard(buttons = [], uid = null) {
+  const rows = (buttons || []).map((btn) => {
     if (btn.type === "url") return [Markup.button.url(btn.label, btn.url)];
     if (btn.type === "screen")
       return [Markup.button.callback(btn.label, `screen:${btn.id}`)];
@@ -60,8 +79,9 @@ function abcdKeyboard() {
   ]);
 }
 
-/* ---------- рендер «экранов» (старт/призы/начать и т.п.) ---------- */
+/* ---------- screens ---------- */
 async function showScreen(ctx, screen) {
+  const uid = ctx.from.id;
   const caption = [
     screen.title ? `<b>${screen.title}</b>` : "",
     screen.text ? screen.text : "",
@@ -69,56 +89,93 @@ async function showScreen(ctx, screen) {
     .filter(Boolean)
     .join("\n\n");
 
+  await ctx.sendChatAction("upload_photo");
+
   return ctx.replyWithPhoto(screen.image_url, {
     caption,
     parse_mode: "HTML",
-    ...toInlineKeyboard(screen.buttons),
+    ...toInlineKeyboard(screen.buttons, uid),
   });
 }
 
-/* ---------- логика выбора колоды ---------- */
-function pickDeckForUser(userId) {
-  // Явно указан debug-индекс → используем тестовые колоды
-  const dbgIdx = process.env.DEBUG_DECK_INDEX;
-  if (
-    dbgIdx !== undefined &&
-    content.debug_decks &&
-    content.debug_decks[Number(dbgIdx)]
-  ) {
-    return [...content.debug_decks[Number(dbgIdx)]];
-  }
+/* быстрый старт — без падений по ctx в таймере */
+async function showStartFast(ctx) {
+  const uid = ctx.from.id;
+  const screen = content.screens.start;
 
-  // По умолчанию — РАБОЧИЕ колоды из pool
+  const caption = [
+    screen.title ? `<b>${screen.title}</b>` : "",
+    screen.text ? screen.text : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+
+  // Моментальный «пинг»
+  const ack = await ctx.reply("Запускаю викторину...");
+  const chatId = ctx.chat.id;
+  const ackId = ack.message_id;
+
+  await ctx.sendChatAction("upload_photo");
+  await ctx.replyWithPhoto(screen.image_url, {
+    caption,
+    parse_mode: "HTML",
+    ...toInlineKeyboard(screen.buttons, uid),
+  });
+
+  setTimeout(() => {
+    bot.telegram.deleteMessage(chatId, ackId).catch(() => {});
+  }, 4000);
+}
+
+/* ---------- deck selection ---------- */
+function pickDeckForUser() {
+  console.log(`[deck] mode=${USE_DEBUG ? "DEBUG" : "PROD"}`);
+  if (
+    USE_DEBUG &&
+    Array.isArray(content.debug_decks) &&
+    content.debug_decks.length
+  ) {
+    const idx = Number(process.env.DEBUG_DECK_INDEX);
+    const deck =
+      Number.isFinite(idx) && content.debug_decks[idx]
+        ? content.debug_decks[idx]
+        : content.debug_decks[0];
+    console.log("[deck] debug deck chosen:", deck.join(", "));
+    return [...deck];
+  }
   const pool = content.deck_pool || [];
-  if (!pool.length)
-    throw new Error(
-      "deck_pool пуст — добавьте рабочие колоды в game_content.json"
-    );
   const rand = Math.floor(Math.random() * pool.length);
-  return [...pool[rand]];
+  const deck = pool[rand] || [];
+  console.log("[deck] prod deck chosen:", deck.join(", "));
+  return [...deck];
 }
 
 function findCard(id) {
   return content.cards.find((c) => c.card_id === id);
 }
 
-/* ---------- ИГРА ---------- */
+/* ---------- game ---------- */
 async function startGame(ctx) {
   const uid = ctx.from.id;
-  const deck = pickDeckForUser(uid);
+  const deck = pickDeckForUser();
   sessions.set(uid, { deck, i: 0, score: 0, awaiting: false });
-  await sendQuestion(ctx);
+
+  const ack = await ctx.reply("Запускаем викторину…");
+  const chatId = ctx.chat.id;
+  const ackId = ack.message_id;
+
+  sendQuestion(ctx).finally(() => {
+    setTimeout(() => {
+      bot.telegram.deleteMessage(chatId, ackId).catch(() => {});
+    }, 5000);
+  });
 }
 
-/** Шапка + вопрос жирным + гарантированные пустые строки между A/B/C/D */
-function buildQuestionCaption(card, index, total) {
-  const header = `<b>Вопрос ${index + 1}/${total}</b>`;
+function buildQuestionCaption(card, idx, total) {
+  const header = `<b>Вопрос ${idx + 1}/${total}</b>`;
   const title = `<b>${card.question}</b>`;
-  const opts = (card.options || [])
-    // добавляем пустую строку после A, B, C (D без хвоста)
-    .map((opt, i, arr) => (i < arr.length - 1 ? `${opt}\n` : opt))
-    .join("\n");
-  return [header, title, "", opts].join("\n");
+  const opts = (card.options || []).join("\n\n");
+  return [header, title, opts].join("\n\n");
 }
 
 async function sendQuestion(ctx) {
@@ -137,8 +194,9 @@ async function sendQuestion(ctx) {
   }
 
   s.awaiting = true;
-  const caption = buildQuestionCaption(card, s.i, qTotal);
 
+  const caption = buildQuestionCaption(card, s.i, qTotal);
+  await ctx.sendChatAction("upload_photo");
   await ctx.replyWithPhoto(card.image_url, {
     caption,
     parse_mode: "HTML",
@@ -150,7 +208,8 @@ bot.action(/^ans:([ABCD])$/, async (ctx) => {
   await ctx.answerCbQuery();
   const uid = ctx.from.id;
   const s = sessions.get(uid);
-  if (!s || !s.awaiting) return;
+  if (!s) return;
+  if (!s.awaiting) return;
 
   s.awaiting = false;
 
@@ -180,10 +239,11 @@ bot.action(/^ans:([ABCD])$/, async (ctx) => {
     .filter(Boolean)
     .join("\n\n");
 
+  await ctx.sendChatAction("upload_photo");
   await ctx.replyWithPhoto(ui?.image_url, {
     caption,
     parse_mode: "HTML",
-    ...(ui?.buttons ? toInlineKeyboard(ui.buttons) : {}),
+    ...(ui?.buttons ? toInlineKeyboard(ui.buttons, uid) : {}),
   });
 });
 
@@ -192,7 +252,6 @@ bot.action(/^cmd:next$/, async (ctx) => {
   const uid = ctx.from.id;
   const s = sessions.get(uid);
   if (!s) return;
-
   s.i += 1;
   await sendQuestion(ctx);
 });
@@ -212,24 +271,33 @@ async function showFinal(ctx) {
         Array.isArray(t.range) && score >= t.range[0] && score <= t.range[1]
     ) || null;
 
-  if (!tier) return ctx.reply(`Ваш результат: ${score}/${qTotal}`);
+  if (!tier) {
+    await ctx.reply(`Ваш результат: ${score}/${qTotal}`);
+    sessions.delete(uid);
+    return;
+  }
 
-  const title = tier.title
-    ? tier.title.replace("{score}", score).replace("{q_total}", qTotal)
-    : "";
-  const text = tier.text
-    ? tier.text.replace("{score}", score).replace("{q_total}", qTotal)
-    : "";
-
+  const title = (tier.title || "")
+    .replace("{score}", score)
+    .replace("{q_total}", qTotal);
+  const text = (tier.text || "")
+    .replace("{score}", score)
+    .replace("{q_total}", qTotal);
   const caption = [title ? `<b>${title}</b>` : "", text]
     .filter(Boolean)
     .join("\n\n");
 
+  await ctx.sendChatAction("upload_photo");
   await ctx.replyWithPhoto(tier.image_url, {
     caption,
     parse_mode: "HTML",
-    ...(tier.buttons ? toInlineKeyboard(tier.buttons) : {}),
+    ...(tier.buttons ? toInlineKeyboard(tier.buttons, uid) : {}),
   });
+
+  let tierKey = 0;
+  if (tiers.tier2 && score >= tiers.tier2.range[0]) tierKey = 2;
+  else if (tiers.tier1 && score >= tiers.tier1.range[0]) tierKey = 1;
+  track("final", { user_id: uid, score, q_total: qTotal, tier: tierKey });
 
   sessions.delete(uid);
 }
@@ -239,9 +307,10 @@ bot.action(/^cmd:final$/, async (ctx) => {
   return showFinal(ctx);
 });
 
-/* ---------- обработчики стартовых экранов ---------- */
+/* ---------- start & synonyms ---------- */
 bot.start(async (ctx) => {
-  await showScreen(ctx, content.screens.start);
+  track("join", { user_id: ctx.from.id, joined_at: new Date().toISOString() });
+  await showStartFast(ctx);
 });
 
 if (
@@ -250,13 +319,19 @@ if (
 ) {
   const syn = new RegExp(content.settings.start_synonyms.join("|"), "i");
   bot.hears(syn, async (ctx) => {
-    await showScreen(ctx, content.screens.start);
+    track("join", {
+      user_id: ctx.from.id,
+      joined_at: new Date().toISOString(),
+    });
+    await showStartFast(ctx);
   });
 }
 
+/* ---------- screen routing ---------- */
 bot.action(/^screen:(.+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const id = ctx.match[1];
+  if (id === "start") return showStartFast(ctx);
   const screen = content.screens[id];
   if (screen) return showScreen(ctx, screen);
 });
@@ -266,13 +341,32 @@ bot.action(/^cmd:go$/, async (ctx) => {
   await startGame(ctx);
 });
 
-/* ---------- полезная команда ---------- */
+/* ---------- admin ---------- */
+const ADMIN_ID = Number(process.env.ADMIN_USER_ID || 0);
 bot.command("whoami", (ctx) => ctx.reply(`Ваш Telegram ID: ${ctx.from.id}`));
+bot.command("stats", async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return;
+  await ctx.reply(`Runtime stats: active sessions = ${sessions.size}`);
+});
 
-/* ---------- ловим ошибки ---------- */
+/* ---------- keep alive & safety ---------- */
 bot.catch((err) => console.error("Bot error:", err));
+process.on("unhandledRejection", (e) =>
+  console.error("unhandledRejection:", e)
+);
+process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
 
-/* ---------- запуск ---------- */
 bot.launch().then(() => console.log("Bot started (long-polling)"));
 process.once("SIGINT", () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));
+// --- tiny HTTP server for health/keep-alive ---
+try {
+  const express = require("express");
+  const app = express();
+  app.get("/", (_, res) => res.send("ok"));
+  app.get("/health", (_, res) => res.json({ ok: true, ts: Date.now() }));
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => console.log(`[http] listening on ${PORT}`));
+} catch (e) {
+  console.log("[http] express not available, skip:", e.message);
+}
