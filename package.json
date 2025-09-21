@@ -21,6 +21,7 @@
   "homepage": "https://github.com/Biggest1978/tg-quiz-bot#readme",
   "dependencies": {
     "dotenv": "^17.2.2",
+    "express": "^5.1.0",
     "telegraf": "^4.16.3"
   }
 }
